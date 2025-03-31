@@ -13,9 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	// "net/http"
-	// _ "net/http/pprof"
-
 	"gopkg.in/yaml.v2"
 )
 
@@ -36,8 +33,8 @@ type configModel struct {
 	ListenAddr    string   `yaml:"listen_addr,omitempty"`
 	EnableSocks   bool     `yaml:"enable_socks5,omitempty"`
 	SocksAddr     string   `yaml:"socks_addr,omitempty"`
-	SocksUser     string   `yaml:"socks_addr,omitempty"`
-	SocksPassword string   `yaml:"socks_addr,omitempty"`
+	SocksUser     string   `yaml:"socks_user,omitempty"`
+	SocksPassword string   `yaml:"socks_password,omitempty"`
 	AllowAllHosts bool     `yaml:"allow_all_hosts,omitempty"`
 }
 
@@ -71,12 +68,6 @@ https://github.com/XIU2/SNIProxy
 	}
 }
 
-// func webPprof() {
-// 	if err := http.ListenAndServe(":6060", nil); err != nil {
-// 		serviceLogger(fmt.Sprintf("启动 pprof 服务失败: %v", err), 31, false)
-// 	}
-// }
-
 func main() {
 	data, err := os.ReadFile(ConfigFilePath) // 读取配置文件
 	if err != nil {
@@ -98,174 +89,160 @@ func main() {
 	serviceLogger(fmt.Sprintf("前置代理: %v", cfg.EnableSocks), 32, false)
 	serviceLogger(fmt.Sprintf("任意域名: %v", cfg.AllowAllHosts), 32, false)
 
-	// go webPprof()   // 启动 pprof 服务
-	startSniProxy() // 启动 SNI Proxy
+	startProxy() // 启动代理服务
 }
 
-// 启动 SNI Proxy
-func startSniProxy() {
-	_, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		serviceLogger(fmt.Sprintf("监听失败: %v", err), 31, false)
-		os.Exit(1)
-	}
-	serviceLogger(fmt.Sprintf("开始监听: %v", listener.Addr()), 0, false)
-
-	go func(listener net.Listener) {
+func startProxy() {
+	// 监听 HTTP (80)
+	go func() {
+		listener, err := net.Listen("tcp", ":80")
+		if err != nil {
+			serviceLogger(fmt.Sprintf("HTTP 监听失败: %v", err), 31, false)
+			return
+		}
 		defer listener.Close()
+		serviceLogger("HTTP 代理已启动 (:80)", 32, false)
+
 		for {
-			connection, err := listener.Accept()
+			conn, err := listener.Accept()
 			if err != nil {
-				serviceLogger(fmt.Sprintf("接受连接请求时出错: %v", err), 31, false)
+				serviceLogger(fmt.Sprintf("HTTP 接受连接失败: %v", err), 31, false)
 				continue
 			}
-			raddr := connection.RemoteAddr().(*net.TCPAddr)
-			serviceLogger("连接来自: "+raddr.String(), 32, false)
-			go serve(connection, raddr.String()) // 有新连接进来，启动一个新线程处理
+			go handleConnection(conn, conn.RemoteAddr().String())
 		}
-	}(listener)
-	ch := make(chan os.Signal, 2)
+	}()
+
+	// 监听 HTTPS (443)
+	listener, err := net.Listen("tcp", ":443")
+	if err != nil {
+		serviceLogger(fmt.Sprintf("HTTPS 监听失败: %v", err), 31, false)
+		os.Exit(1)
+	}
+	defer listener.Close()
+	serviceLogger("HTTPS 代理已启动 (:443)", 32, false)
+
+	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	s := <-ch
-	cancel()
-	fmt.Printf("\n接收到信号 %s, 退出.\n", s)
-}
-
-// 处理新连接
-func serve(c net.Conn, raddr string) {
-	defer c.Close()
-
-	buf := make([]byte, 2048)
-	var fullHeader []byte
-	const maxAttempts = 2
-	attempts := 0
+	go func() {
+		<-ch
+		listener.Close()
+		os.Exit(0)
+	}()
 
 	for {
-		n, err := c.Read(buf)
-		if err != nil && err != io.EOF {
-			serviceLogger(fmt.Sprintf("读取连接请求时出错: %v", err), 31, false)
-			return
+		conn, err := listener.Accept()
+		if err != nil {
+			serviceLogger(fmt.Sprintf("HTTPS 接受连接失败: %v", err), 31, false)
+			continue
 		}
-		fullHeader = append(fullHeader, buf[:n]...)
-
-		if len(fullHeader) < 5 { // 判断是不是 TLS 握手消息
-			serviceLogger("不是 TLS 握手消息", 31, true)
-			return
-		} else if IsCompleteHandshake(fullHeader) { // 检查是否已经接收到完整的 TLS 握手消息
-			break // 如果已经完整，那么退出循环
-		}
-
-		attempts++
-		if attempts >= maxAttempts {
-			serviceLogger("接收握手消息超时...", 31, false)
-			return // 如果超过最大等待次数，退出函数
-		}
+		go handleConnection(conn, conn.RemoteAddr().String())
 	}
-	if attempts > 0 { // 如果等于 0 说明第一次就接收到了完整握手消息，如果大于 0 说明握手消息丢包或分段了
-		serviceLogger("已接收到完整握手消息...", 32, true)
+}
+
+func handleConnection(c net.Conn, raddr string) {
+	// defer c.Close() // debug
+
+	// 读取第一个字节判断协议类型
+	buf := make([]byte, 1)
+	_, err := c.Read(buf)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("读取失败: %v", err), 31, false)
+		return
 	}
 
-	ServerName := getSNIServerName(fullHeader) // 获取 SNI 域名
+	// 0x16 是 TLS 握手的第一字节, 其他 = HTTP
+	if buf[0] == 0x16 {
+		handleHTTPS(c, buf, raddr)
+	} else {
+		handleHTTP(c, buf, raddr)
+	}
+}
 
+func handleHTTPS(c net.Conn, firstByte []byte, raddr string) {
+	buf := make([]byte, 2048)
+	n, err := c.Read(buf)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("读取 HTTPS 数据失败: %v", err), 31, false)
+		return
+	}
+	fullHeader := append(firstByte, buf[:n]...)
+
+	ServerName := getSNIServerName(fullHeader)
 	if ServerName == "" {
 		serviceLogger("未找到 SNI 域名, 忽略...", 31, true)
 		return
 	}
 
-	if cfg.AllowAllHosts { // 如果 allow_all_hosts 为 true 则代表无需判断 SNI 域名
-		serviceLogger(fmt.Sprintf("转发目标: %s:%d", ServerName, ForwardPort), 32, false)
+	if cfg.AllowAllHosts {
+		serviceLogger(fmt.Sprintf("[HTTPS] 转发目标: %s:%d", ServerName, ForwardPort), 32, false)
 		forward(c, fullHeader, fmt.Sprintf("%s:%d", ServerName, ForwardPort), raddr)
 		return
 	}
 
-	for _, rule := range cfg.ForwardRules { // 循环遍历 Rules 中指定的白名单域名
-		if strings.Contains(ServerName, rule) { // 如果 SNI 域名中包含 Rule 白名单域名（例如 www.aa.com 中包含 aa.com）则转发该连接
-			serviceLogger(fmt.Sprintf("转发目标: %s:%d", ServerName, ForwardPort), 32, false)
+	for _, rule := range cfg.ForwardRules {
+		if strings.Contains(ServerName, rule) {
+			serviceLogger(fmt.Sprintf("[HTTPS] 转发目标: %s:%d", ServerName, ForwardPort), 32, false)
 			forward(c, fullHeader, fmt.Sprintf("%s:%d", ServerName, ForwardPort), raddr)
+			return
 		}
 	}
 }
 
-// 判断握手消息是否完整
-func IsCompleteHandshake(header []byte) bool {
-	Length := binary.BigEndian.Uint16(header[3:5])
-	return len(header) >= int(Length)+5
+func handleHTTP(c net.Conn, firstByte []byte, raddr string) {
+	// 读取完整请求头（包括第一个字节）
+	buf := make([]byte, 4096)
+	n, err := c.Read(buf)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("读取 HTTP 请求失败: %v", err), 31, false)
+		return
+	}
+	fullRequest := append(firstByte, buf[:n]...) // 合并第一个字节和剩余数据
+
+	host := extractHostFromHTTPHeader(fullRequest)
+	if host == "" {
+		serviceLogger("未找到 Host 头, 忽略...", 31, true)
+		return
+	}
+
+	// 直接转发完整请求（不再丢弃请求头）
+	serviceLogger(fmt.Sprintf("[HTTP] 转发目标: %s:80", host), 32, false)
+	forward(c, fullRequest, fmt.Sprintf("%s:80", host), raddr) // 注意：目标端口固定为80
 }
 
-// 获取 SNI 域名
-func getSNIServerName(buf []byte) string {
-	n := len(buf)
-	if n < 5 {
-		serviceLogger("不是 TLS 握手消息", 31, true)
-		return ""
+func extractHostFromHTTPHeader(header []byte) string {
+	lines := strings.Split(string(header), "\r\n")
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "host: ") {
+			return strings.TrimSpace(line[6:])
+		}
 	}
-
-	// TLS 记录类型
-	if recordType(buf[0]) != recordTypeHandshake {
-		serviceLogger("不是 TLS", 31, true)
-		return ""
-	}
-
-	// TLS 主要版本
-	if buf[1] != 3 {
-		serviceLogger("不支持 TLS 版本 < 3", 31, true)
-		return ""
-	}
-
-	// payload 长度
-	//l := int(buf[3])<<16 + int(buf[4])
-	//log.Printf("length: %d, got: %d", l, n)
-
-	// 握手消息类型
-	if buf[5] != typeClientHello {
-		serviceLogger("不是 Client Hello 消息", 31, true)
-		return ""
-	}
-
-	// 以下开始解析 Client Hello 消息
-	msg := &clientHelloMsg{}
-	// Client Hello 不包含 TLS 标头, 5 字节
-	ret := msg.unmarshal(buf[5:n])
-	if !ret {
-		serviceLogger("解析 Client Hello 消息失败", 31, true)
-		return ""
-	}
-	return msg.serverName
+	return ""
 }
 
-// forward 函数接收一个 net.Conn 类型的连接对象 conn、一个 []byte 类型的数据 data、一个目标地址 dst、一个来源地址 raddr
-// 该函数使用 GetDialer 函数创建一个与目标地址 dst 的后端连接 backend，将 data 写入 backend，然后使用 ioReflector 函数将 backend 和 conn 连接起来，以便将数据从一个连接转发到另一个连接
 func forward(conn net.Conn, data []byte, dst string, raddr string) {
 	backend, err := GetDialer(cfg.EnableSocks).Dial("tcp", dst)
 	if err != nil {
 		serviceLogger(fmt.Sprintf("无法连接到后端, %v", err), 31, false)
 		return
 	}
-
 	defer backend.Close()
 
-	if _, err = backend.Write(data); err != nil {
-		serviceLogger(fmt.Sprintf("无法传输到后端, %v", err), 31, false)
-		return
+	if data != nil {
+		if _, err = backend.Write(data); err != nil {
+			serviceLogger(fmt.Sprintf("无法传输到后端, %v", err), 31, false)
+			return
+		}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
+	// 移除未使用的 ctx 和 cancel
 	conChk := make(chan struct{})
-	go ioReflector(ctx, backend, conn, false, conChk, raddr, dst)
-	go ioReflector(ctx, conn, backend, true, conChk, raddr, dst)
+	go ioReflector(context.Background(), backend, conn, false, conChk, raddr, dst)
+	go ioReflector(context.Background(), conn, backend, true, conChk, raddr, dst)
 	<-conChk
-	// 取消上下文，通知另一个 ioReflector 退出
-	cancel()
 }
 
-// ioReflector 函数接收一个 io.WriteCloser 类型的写入对象 dst、一个 io.Reader 类型的读取对象 src、一个 bool 类型的 isToClient、一个 chan struct{} 类型的 conChk，以及两个字符串类型的 raddr 和 dsts
-// 该函数使用 io.Copy 函数将 src 中读取到的数据流复制到 dst 中，然后将转发的字节数写入日志
-// 最后，该函数关闭 dst 连接，并向 conChk 通道发送一个信号以表示连接已关闭。
 func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToClient bool, conChk chan struct{}, raddr string, dsts string) {
-	// 将 IO 流反映到另一个
 	defer onDisconnect(dst, conChk)
 
 	done := make(chan struct{})
@@ -281,16 +258,11 @@ func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToCli
 
 	select {
 	case <-ctx.Done():
-		// 上下文取消，退出
 	case <-done:
-		// 复制完成，退出
 	}
 }
 
-// onDisconnect 函数接收一个 io.WriteCloser 类型的写入对象 dst 和一个 chan struct{} 类型的 conChk
-// 该函数在 dst 连接关闭时被调用，并向 conChk 通道发送一个信号以表示连接已关闭
 func onDisconnect(dst io.WriteCloser, conChk chan struct{}) {
-	// 关闭时 -> 强制断开另一对连接
 	dst.Close()
 	select {
 	case conChk <- struct{}{}:
@@ -298,7 +270,27 @@ func onDisconnect(dst io.WriteCloser, conChk chan struct{}) {
 	}
 }
 
-// 解析 Client Hello 消息
+func getSNIServerName(buf []byte) string {
+	if len(buf) < 5 {
+		return ""
+	}
+
+	if buf[0] != 0x16 { // 不是 TLS 握手
+		return ""
+	}
+
+	length := binary.BigEndian.Uint16(buf[3:5])
+	if len(buf) < int(length)+5 {
+		return ""
+	}
+
+	msg := &clientHelloMsg{}
+	if !msg.unmarshal(buf[5:]) {
+		return ""
+	}
+	return msg.serverName
+}
+
 func (m *clientHelloMsg) unmarshal(data []byte) bool {
 	if len(data) < 42 {
 		return false
@@ -315,7 +307,6 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 	if len(data) < 2 {
 		return false
 	}
-	// cipherSuiteLen 是密码套件编号的字节数。由于是 uint16，因此数字必须是偶数
 	cipherSuiteLen := int(data[0])<<8 | int(data[1])
 	if cipherSuiteLen%2 == 1 || len(data) < 2+cipherSuiteLen {
 		return false
@@ -324,9 +315,6 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 	m.cipherSuites = make([]uint16, numCipherSuites)
 	for i := 0; i < numCipherSuites; i++ {
 		m.cipherSuites[i] = uint16(data[2+2*i])<<8 | uint16(data[3+2*i])
-		if m.cipherSuites[i] == scsvRenegotiation {
-			m.secureRenegotiationSupported = true
-		}
 	}
 	data = data[2+cipherSuiteLen:]
 	if len(data) < 1 {
@@ -350,7 +338,6 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 	m.scts = false
 
 	if len(data) == 0 {
-		// ClientHello 后面可选地跟着扩展数据
 		return true
 	}
 	if len(data) < 2 {
@@ -397,7 +384,6 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 				}
 				if nameType == 0 {
 					m.serverName = string(d[:nameLen])
-					// SNI 值末尾不能有点
 					if strings.HasSuffix(m.serverName, ".") {
 						return false
 					}
@@ -405,105 +391,12 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 				}
 				d = d[nameLen:]
 			}
-		case extensionNextProtoNeg:
-			if length > 0 {
-				return false
-			}
-			m.nextProtoNeg = true
-		case extensionStatusRequest:
-			m.ocspStapling = length > 0 && data[0] == statusTypeOCSP
-		case extensionSupportedCurves:
-			// http://tools.ietf.org/html/rfc4492#section-5.5.1
-			if length < 2 {
-				return false
-			}
-			l := int(data[0])<<8 | int(data[1])
-			if l%2 == 1 || length != l+2 {
-				return false
-			}
-			numCurves := l / 2
-			m.supportedCurves = make([]CurveID, numCurves)
-			d := data[2:]
-			for i := 0; i < numCurves; i++ {
-				m.supportedCurves[i] = CurveID(d[0])<<8 | CurveID(d[1])
-				d = d[2:]
-			}
-		case extensionSupportedPoints:
-			// http://tools.ietf.org/html/rfc4492#section-5.5.2
-			if length < 1 {
-				return false
-			}
-			l := int(data[0])
-			if length != l+1 {
-				return false
-			}
-			m.supportedPoints = make([]uint8, l)
-			copy(m.supportedPoints, data[1:])
-		case extensionSessionTicket:
-			// http://tools.ietf.org/html/rfc5077#section-3.2
-			m.ticketSupported = true
-			m.sessionTicket = data[:length]
-		case extensionSignatureAlgorithms:
-			// https://tools.ietf.org/html/rfc5246#section-7.4.1.4.1
-			if length < 2 || length&1 != 0 {
-				return false
-			}
-			l := int(data[0])<<8 | int(data[1])
-			if l != length-2 {
-				return false
-			}
-			n := l / 2
-			d := data[2:]
-			m.signatureAndHashes = make([]signatureAndHash, n)
-			for i := range m.signatureAndHashes {
-				m.signatureAndHashes[i].hash = d[0]
-				m.signatureAndHashes[i].signature = d[1]
-				d = d[2:]
-			}
-		case extensionRenegotiationInfo:
-			if length == 0 {
-				return false
-			}
-			d := data[:length]
-			l := int(d[0])
-			d = d[1:]
-			if l != len(d) {
-				return false
-			}
-
-			m.secureRenegotiation = d
-			m.secureRenegotiationSupported = true
-		case extensionALPN:
-			if length < 2 {
-				return false
-			}
-			l := int(data[0])<<8 | int(data[1])
-			if l != length-2 {
-				return false
-			}
-			d := data[2:length]
-			for len(d) != 0 {
-				stringLen := int(d[0])
-				d = d[1:]
-				if stringLen == 0 || stringLen > len(d) {
-					return false
-				}
-				m.alpnProtocols = append(m.alpnProtocols, string(d[:stringLen]))
-				d = d[stringLen:]
-			}
-		case extensionSCT:
-			m.scts = true
-			if length != 0 {
-				return false
-			}
 		}
 		data = data[length:]
 	}
-
 	return true
 }
 
-// 输出日志
 func serviceLogger(log string, color int, isDebug bool) {
 	if isDebug && !EnableDebug {
 		return
