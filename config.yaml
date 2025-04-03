@@ -4,7 +4,9 @@ listen_addr: ":443"
 # 可选：启用 Socks5 前置代理
 #enable_socks5: true
 # 可选：配置 Socks5 代理地址
-#socks_addr: 127.0.0.1:40000
+# ipv4 127.0.0.1:40000
+# ipv6 [fe80::1]:40000
+#socks_addr: "127.0.0.1:40000"
 #socks_user: "your_username"
 #socks_password: "your_password"
 
